@@ -44,16 +44,9 @@ async fn handle_connection(
         .context("failed to connect to target server")?;
     let mut client_connection = rx.reunite(tx).context("failed to reunite connection")?;
 
-    /// A 128 KiB buffer size for each direction.
-    const BUF_SIZE: usize = 128 * 1024;
-    tokio::io::copy_bidirectional_with_sizes(
-        &mut client_connection,
-        &mut server_connection,
-        BUF_SIZE,
-        BUF_SIZE,
-    )
-    .await
-    .context("failed to proxy data")?;
+    tokio::io::copy_bidirectional(&mut client_connection, &mut server_connection)
+        .await
+        .context("failed to proxy data")?;
 
     Ok(())
 }
