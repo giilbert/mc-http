@@ -44,9 +44,14 @@ async fn handle_connection(
         .context("failed to connect to target server")?;
     let mut client_connection = rx.reunite(tx).context("failed to reunite connection")?;
 
-    tokio::io::copy_bidirectional(&mut client_connection, &mut server_connection)
-        .await
-        .context("failed to proxy data")?;
+    let io_sl2sr = tokio_splice2::context::SpliceIoCtx::prepare()?.into_io();
+    let io_sr2sl = tokio_splice2::context::SpliceIoCtx::prepare()?.into_io();
+
+    let traffic = tokio_splice2::SpliceBidiIo { io_sl2sr, io_sr2sl }
+        .execute(&mut server_connection, &mut client_connection)
+        .await;
+
+    tracing::info!("connection from {address:?} to server {target_server} closed: {traffic:?}");
 
     Ok(())
 }
