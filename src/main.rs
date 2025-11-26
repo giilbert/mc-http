@@ -1,25 +1,23 @@
 mod config;
+mod gen_vec;
 mod parser;
+mod socket;
 mod token;
+mod utils;
 
-use std::{
-    mem::MaybeUninit,
-    net::{SocketAddr, TcpListener},
-    os::fd::AsRawFd,
-    path::PathBuf,
-    pin::Pin,
-};
+use std::{mem::MaybeUninit, net::TcpListener, os::fd::AsRawFd, path::PathBuf, pin::Pin};
 
 use anyhow::Context;
 use clap::Parser;
-use io_uring::{
-    IoUring, opcode,
-    types::{self, Fd},
-};
+use io_uring::{IoUring, types::Fd};
 use tracing::instrument;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::Config, token::Token};
+use crate::{
+    config::Config,
+    socket::{Socket, SocketUninit},
+    token::Token,
+};
 
 /// A simple runtime for executing futures interacting with io_uring.
 struct Rt {
@@ -43,15 +41,11 @@ impl Rt {
         let listener = TcpListener::bind(&addr).context(format!("failed to bind to {addr}"))?;
 
         // Add the initial accept operation to the ring.
-        let mut pending_socket = Box::pin(SocketUninit {
+        let pending_socket = Box::pin(SocketUninit {
             addr: MaybeUninit::uninit(),
             sock_addr_len: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         });
-        let accept = opcode::Accept::new(
-            Fd(listener.as_raw_fd()),
-            pending_socket.addr.as_mut_ptr() as *mut _,
-            &mut pending_socket.sock_addr_len,
-        );
+        let accept = pending_socket.sqe(Fd(listener.as_raw_fd()));
 
         unsafe {
             // SAFETY: The listener's file descriptor is kept alive by Rt and the operation is
@@ -121,98 +115,6 @@ impl Rt {
         loop {
             self.run_once()?;
         }
-    }
-}
-
-impl RtInner {
-    /// Called when a new connection has been accepted.
-    ///
-    /// This method reads the address information from the pending socket, sets up the new
-    /// connection, and then resets the accept operation for the next incoming connection.
-    #[instrument(skip(self))]
-    fn on_accept(&mut self, socket_id: u32, result: i32) -> anyhow::Result<()> {
-        tracing::debug!("accepted connection on socket id {}", socket_id);
-
-        // Errors in io uring are indicated by negative result codes.
-        if result < 0 {
-            let code = -result;
-            let io_error = std::io::Error::from_raw_os_error(code);
-            anyhow::bail!("accept operation failed: {}", io_error);
-        }
-
-        // Check that the number of bytes written matches the expected size of a libc::sockaddr_in.
-        let written_bytes = self.pending_socket.sock_addr_len as usize;
-        if written_bytes as usize != std::mem::size_of::<libc::sockaddr_in>() {
-            anyhow::bail!(
-                "accept operation returned unexpected address size: {} (expected {})",
-                written_bytes,
-                std::mem::size_of::<libc::sockaddr_in>()
-            );
-        }
-
-        // SAFETY: The address storage is valid and was initialized by the accept operation.
-        let data = unsafe { self.pending_socket.addr.assume_init_read() };
-
-        if data.sin_family as i32 != libc::AF_INET {
-            anyhow::bail!(
-                "accepted connection with unsupported address family: {} (expected AF_INET {})",
-                data.sin_family,
-                libc::AF_INET
-            );
-        }
-
-        let socket_fd = Fd(result);
-        let port = data.sin_port.to_be();
-        let ip = std::net::Ipv4Addr::from(u32::from_be(data.sin_addr.s_addr));
-        let addr = SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
-
-        tracing::info!("new connection from {}", addr);
-
-        // Add to the list of connected sockets.
-        let socket = Socket {
-            fd: types::Fd(socket_fd.0),
-            addr,
-        };
-        self.sockets.push(socket);
-
-        // Reset the pending socket for the next accept operation.
-        *self.pending_socket = SocketUninit::new();
-
-        Ok(())
-    }
-}
-
-/// A connected socket.
-struct Socket {
-    fd: types::Fd,
-    addr: SocketAddr,
-}
-
-/// A socket that is pending an accept operation.
-///
-/// It is important to keep the address storage alive and in the same memory location until the
-/// accept operation completes.
-struct SocketUninit {
-    addr: MaybeUninit<libc::sockaddr_in>,
-    sock_addr_len: libc::socklen_t,
-}
-
-impl SocketUninit {
-    /// Creates a new uninitialized socket storage.
-    fn new() -> Self {
-        Self {
-            addr: MaybeUninit::uninit(),
-            sock_addr_len: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        }
-    }
-
-    /// Creates an accept opcode for this socket.
-    fn sqe(&self, fd: Fd) -> opcode::Accept {
-        opcode::Accept::new(
-            fd,
-            self.addr.as_ptr() as *mut _,
-            &self.sock_addr_len as *const _ as *mut _,
-        )
     }
 }
 
