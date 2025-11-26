@@ -44,6 +44,13 @@ async fn handle_connection(
         .context("failed to connect to target server")?;
     let mut client_connection = rx.reunite(tx).context("failed to reunite connection")?;
 
+    server_connection
+        .set_nodelay(true)
+        .context("failed to set nodelay")?;
+    client_connection
+        .set_nodelay(true)
+        .context("failed to set nodelay")?;
+
     let io_sl2sr = tokio_splice2::context::SpliceIoCtx::prepare()?.into_io();
     let io_sr2sl = tokio_splice2::context::SpliceIoCtx::prepare()?.into_io();
 
