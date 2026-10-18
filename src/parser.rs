@@ -115,48 +115,106 @@ pub struct UnifiedHandshakeFormat {
     // pub port: u16,
 }
 
+/// The result of trying to parse a handshake from the start of a connection.
+#[derive(Debug)]
+pub enum ParseResult {
+    /// More bytes are needed before the handshake can be parsed.
+    Incomplete,
+    /// The bytes do not look like a handshake.
+    Unrecognized,
+    Handshake(UnifiedHandshakeFormat),
+}
+
 impl UnifiedHandshakeFormat {
-    /// Tries to parse a Unified Handshake Format from the given bytes.
+    /// Tries to parse a Unified Handshake Format from the start of the given bytes.
     ///
-    /// If the bytes do not represent a valid handshake, Ok(None) is returned.
-    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Option<Self>> {
+    /// Only the first packet is looked at, so any packets following the handshake (e.g. the status
+    /// request or login start, which clients often send in the same TCP segment) are ignored.
+    pub fn from_bytes(bytes: &[u8]) -> ParseResult {
         let mut buf = Buffer::new(bytes);
 
         const PRE_1_7_PROTOCOL_MAGIC: [u8; 3] = [0xfe, 0x01, 0xfa];
-        let peek = buf.peek(3)?;
+        let Ok(peek) = buf.peek(3) else {
+            return ParseResult::Incomplete;
+        };
+
         if peek == PRE_1_7_PROTOCOL_MAGIC {
-            let _magic = buf.advance(PRE_1_7_PROTOCOL_MAGIC.len())?;
+            // magic + "MC|PingHost" as a UTF-16 string + 2 byte payload length
+            const HEADER_LEN: usize = 3 + 2 + 11 * 2 + 2;
+            let Ok(header) = buf.advance(HEADER_LEN) else {
+                return ParseResult::Incomplete;
+            };
+            let payload_length =
+                u16::from_be_bytes([header[HEADER_LEN - 2], header[HEADER_LEN - 1]]) as usize;
+            let Ok(payload) = buf.advance(payload_length) else {
+                return ParseResult::Incomplete;
+            };
 
-            let message = buf.next_string_utf16()?;
-            if message != "MC|PingHost" {
-                anyhow::bail!(
-                    "malformed pre-1.7 handshake: unexpected message '{}'",
-                    message
-                );
-            }
-
-            // next 2 bytes are the length of the rest of the payload
-            let _payload_length = u16::from_be_bytes(
-                buf.advance(2)?
-                    .try_into()
-                    .context("failed to read payload length")?,
-            );
-            let _protocol_version = buf.advance(1)?; // 1 byte protocol version
-
-            let hostname = buf.next_string_utf16()?;
-            // last 4 bytes are the port
-            let _port = u32::from_be_bytes(buf.next_n::<4>().context("failed to read port")?);
-
-            // if there are any bytes left, the handshake is probably not a handshake
-            if buf.left() != 0 {
-                return Ok(None);
-            }
-
-            return Ok(Some(UnifiedHandshakeFormat { hostname }));
+            return match Self::parse_pre_1_7(header, payload) {
+                Ok(handshake) => ParseResult::Handshake(handshake),
+                Err(_) => ParseResult::Unrecognized,
+            };
         }
 
         // Assume modern handshake format
-        let _packet_length = buf.next_varint()?;
+        let packet_length = match buf.next_varint() {
+            Ok(length) => length,
+            // a varint is at most 5 bytes long, so if we had more than that, it is malformed
+            Err(_) if bytes.len() > 5 => return ParseResult::Unrecognized,
+            Err(_) => return ParseResult::Incomplete,
+        };
+        let Ok(packet_length) = usize::try_from(packet_length) else {
+            return ParseResult::Unrecognized;
+        };
+
+        // bail out early on anything that isn't a handshake packet (id 0x00) instead of waiting
+        // for `packet_length` bytes that may never come (e.g. a short HTTP request)
+        match buf.peek(1) {
+            Ok([0x00]) => {}
+            Ok(_) => return ParseResult::Unrecognized,
+            Err(_) => return ParseResult::Incomplete,
+        }
+
+        let Ok(packet) = buf.advance(packet_length) else {
+            return ParseResult::Incomplete;
+        };
+
+        match Self::parse_modern(packet) {
+            Ok(handshake) => ParseResult::Handshake(handshake),
+            Err(_) => ParseResult::Unrecognized,
+        }
+    }
+
+    /// Parses a pre-1.7 server list ping, given its fixed-size header and its payload.
+    fn parse_pre_1_7(header: &[u8], payload: &[u8]) -> anyhow::Result<Self> {
+        let mut header = Buffer::new(&header[3..]);
+        let message = header.next_string_utf16()?;
+        if message != "MC|PingHost" {
+            anyhow::bail!(
+                "malformed pre-1.7 handshake: unexpected message '{}'",
+                message
+            );
+        }
+
+        let mut buf = Buffer::new(payload);
+        let _protocol_version = buf.advance(1)?; // 1 byte protocol version
+
+        let hostname = buf.next_string_utf16()?;
+        // last 4 bytes are the port
+        let _port = u32::from_be_bytes(buf.next_n::<4>().context("failed to read port")?);
+
+        // if there are any bytes left, the handshake is probably not a handshake
+        if buf.left() != 0 {
+            anyhow::bail!("trailing bytes in pre-1.7 handshake");
+        }
+
+        Ok(UnifiedHandshakeFormat { hostname })
+    }
+
+    /// Parses a modern handshake packet, excluding the packet length prefix.
+    fn parse_modern(packet: &[u8]) -> anyhow::Result<Self> {
+        let mut buf = Buffer::new(packet);
+
         let _packet_id = buf.next_varint()?;
         let _protocol_version = buf.next_varint()?;
 
@@ -166,9 +224,128 @@ impl UnifiedHandshakeFormat {
 
         // if there are any bytes left, the handshake is probably not a handshake
         if buf.left() != 0 {
-            return Ok(None);
+            anyhow::bail!("trailing bytes in handshake");
         }
 
-        Ok(Some(UnifiedHandshakeFormat { hostname }))
+        Ok(UnifiedHandshakeFormat { hostname })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a modern handshake packet for `hostname`.
+    fn modern_handshake(hostname: &str) -> Vec<u8> {
+        let mut packet = vec![0x00, 0xff, 0x05]; // packet id, protocol version 767 (varint)
+        packet.push(hostname.len() as u8);
+        packet.extend_from_slice(hostname.as_bytes());
+        packet.extend_from_slice(&25565u16.to_be_bytes());
+        packet.push(0x01); // next state: status
+
+        let mut framed = vec![packet.len() as u8];
+        framed.extend(packet);
+        framed
+    }
+
+    fn utf16_string(s: &str) -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut out = (units.len() as u16).to_be_bytes().to_vec();
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    }
+
+    fn pre_1_7_ping(hostname: &str) -> Vec<u8> {
+        let mut payload = vec![74]; // protocol version
+        payload.extend(utf16_string(hostname));
+        payload.extend_from_slice(&25565u32.to_be_bytes());
+
+        let mut out = vec![0xfe, 0x01, 0xfa];
+        out.extend(utf16_string("MC|PingHost"));
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend(payload);
+        out
+    }
+
+    fn hostname(result: ParseResult) -> String {
+        match result {
+            ParseResult::Handshake(handshake) => handshake.hostname,
+            other => panic!("expected handshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modern_handshake_alone() {
+        let bytes = modern_handshake("mc.example.com");
+        assert_eq!(
+            hostname(UnifiedHandshakeFormat::from_bytes(&bytes)),
+            "mc.example.com"
+        );
+    }
+
+    #[test]
+    fn modern_handshake_followed_by_status_request() {
+        let mut bytes = modern_handshake("mc.example.com");
+        bytes.extend_from_slice(&[0x01, 0x00]);
+        assert_eq!(
+            hostname(UnifiedHandshakeFormat::from_bytes(&bytes)),
+            "mc.example.com"
+        );
+    }
+
+    #[test]
+    fn modern_handshake_followed_by_login_start() {
+        let mut bytes = modern_handshake("mc.example.com");
+        bytes.extend_from_slice(&[0x08, 0x00, 0x06, b'S', b't', b'e', b'v', b'e', b'!']);
+        assert_eq!(
+            hostname(UnifiedHandshakeFormat::from_bytes(&bytes)),
+            "mc.example.com"
+        );
+    }
+
+    #[test]
+    fn modern_handshake_truncated() {
+        let bytes = modern_handshake("mc.example.com");
+        for len in 0..bytes.len() {
+            assert!(
+                matches!(
+                    UnifiedHandshakeFormat::from_bytes(&bytes[..len]),
+                    ParseResult::Incomplete
+                ),
+                "expected incomplete at length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_1_7_ping_alone() {
+        let bytes = pre_1_7_ping("mc.example.com");
+        assert_eq!(
+            hostname(UnifiedHandshakeFormat::from_bytes(&bytes)),
+            "mc.example.com"
+        );
+    }
+
+    #[test]
+    fn pre_1_7_ping_truncated() {
+        let bytes = pre_1_7_ping("mc.example.com");
+        for len in 0..bytes.len() {
+            assert!(
+                matches!(
+                    UnifiedHandshakeFormat::from_bytes(&bytes[..len]),
+                    ParseResult::Incomplete
+                ),
+                "expected incomplete at length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_is_unrecognized() {
+        let bytes = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(matches!(
+            UnifiedHandshakeFormat::from_bytes(bytes),
+            ParseResult::Unrecognized
+        ));
     }
 }
