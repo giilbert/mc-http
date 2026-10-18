@@ -72,12 +72,23 @@ async fn handle_connection(
     tracing::debug!("parsed handshake: {:?}", handshake);
 
     let target_server = match handshake {
-        Some(handshake) => config
-            .data()
-            .servers
-            .get(&handshake.hostname)
-            .cloned()
-            .unwrap_or_else(|| config.data().default.clone()),
+        Some(handshake) => {
+            // '\0FORGE' is sometimes appended to the hostname by Forge, which breaks our server
+            // mapping. We strip it out here to ensure that the hostname is matched correctly.
+            let handshake_before_null = handshake
+                .hostname
+                .split('\0')
+                .next()
+                .unwrap_or(&handshake.hostname)
+                .to_string();
+
+            config
+                .data()
+                .servers
+                .get(&handshake_before_null)
+                .cloned()
+                .unwrap_or_else(|| config.data().default.clone())
+        }
         None => config.data().default.clone(),
     };
 
